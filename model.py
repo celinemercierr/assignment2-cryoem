@@ -130,7 +130,7 @@ class BCEDiceLoss(nn.Module):
 # ------------------------------------------------------------------ #
  
 class MicrographCleaner(pl.LightningModule):
-    def __init__(self, base_channels=32, learning_rate=1e-3):
+    def __init__(self, base_channels=32, learning_rate=3e-4):
         super().__init__()
         self.save_hyperparameters()
         self.model   = UNet(base_channels=base_channels)

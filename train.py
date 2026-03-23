@@ -15,7 +15,7 @@ def main():
     # Training parameters
     WINDOW_SIZE = 512
     BATCH_SIZE = 4
-    N_EPOCHS = 10
+    N_EPOCHS = 20
 
     # Load and split data
     train_df = pd.read_csv('train.csv')

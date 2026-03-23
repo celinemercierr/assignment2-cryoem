@@ -14,8 +14,8 @@ from dataset import TrainMicrographDataset, ValidationMicrographDataset
 def main():
     # Training parameters
     WINDOW_SIZE = 512
-    BATCH_SIZE = 4
-    N_EPOCHS = 15
+    BATCH_SIZE = 2
+    N_EPOCHS = 30
 
     # Load and split data
     train_df = pd.read_csv('train.csv')

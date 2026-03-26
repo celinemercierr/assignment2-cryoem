@@ -4,146 +4,173 @@ import pytorch_lightning as pl
 
 
 # ------------------------------------------------------------------ #
-# Residual double conv block
+# Building blocks
 # ------------------------------------------------------------------ #
 
-class ResDoubleConv(nn.Module):
-    """Two conv layers with a residual (skip) connection inside the block."""
-    def __init__(self, in_channels, out_channels, dropout=0.1):
+class ResBlock(nn.Module):
+    """Residual block with GroupNorm + dropout."""
+    def __init__(self, channels, dropout=0.1):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, out_channels),
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.GroupNorm(8, channels),
             nn.ReLU(inplace=True),
             nn.Dropout2d(dropout),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, out_channels),
-        )
-        # 1x1 conv to match channels if needed
-        self.shortcut = (
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-            if in_channels != out_channels else nn.Identity()
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.GroupNorm(8, channels),
         )
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        return self.relu(self.conv(x) + self.shortcut(x))
+        return self.relu(self.block(x) + x)
 
 
-class Down(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class EncoderBlock(nn.Module):
+    """Conv to change channels + 2 residual blocks."""
+    def __init__(self, in_ch, out_ch, dropout=0.1):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.MaxPool2d(2),
-            ResDoubleConv(in_channels, out_channels),
+        self.entry = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.ReLU(inplace=True),
         )
+        self.res1 = ResBlock(out_ch, dropout)
+        self.res2 = ResBlock(out_ch, dropout)
 
     def forward(self, x):
-        return self.block(x)
+        x = self.entry(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
 
 
-class Up(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class DecoderBlock(nn.Module):
+    """Upsample + concat skip + 2 residual blocks."""
+    def __init__(self, in_ch, skip_ch, out_ch, dropout=0.1):
         super().__init__()
-        self.up   = nn.ConvTranspose2d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
-        self.conv = ResDoubleConv(in_channels, out_channels)
+        self.up   = nn.ConvTranspose2d(in_ch, in_ch, 2, stride=2)
+        self.entry = nn.Sequential(
+            nn.Conv2d(in_ch + skip_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.res1 = ResBlock(out_ch, dropout)
+        self.res2 = ResBlock(out_ch, dropout)
 
     def forward(self, x, skip):
         x = self.up(x)
-        if x.shape != skip.shape:
+        if x.shape[2:] != skip.shape[2:]:
             x = nn.functional.interpolate(x, size=skip.shape[2:])
-        x = torch.cat([skip, x], dim=1)
-        return self.conv(x)
+        x = torch.cat([x, skip], dim=1)
+        x = self.entry(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
+
+
+class ASPP(nn.Module):
+    """Atrous Spatial Pyramid Pooling — captures multi-scale context."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv1 = nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, bias=False), nn.GroupNorm(8, out_ch), nn.ReLU(inplace=True))
+        self.conv2 = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=6,  dilation=6,  bias=False), nn.GroupNorm(8, out_ch), nn.ReLU(inplace=True))
+        self.conv3 = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=12, dilation=12, bias=False), nn.GroupNorm(8, out_ch), nn.ReLU(inplace=True))
+        self.conv4 = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=18, dilation=18, bias=False), nn.GroupNorm(8, out_ch), nn.ReLU(inplace=True))
+        self.pool  = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(in_ch, out_ch, 1, bias=False), nn.ReLU(inplace=True))
+        self.proj  = nn.Sequential(nn.Conv2d(out_ch * 5, out_ch, 1, bias=False), nn.GroupNorm(8, out_ch), nn.ReLU(inplace=True), nn.Dropout2d(0.1))
+
+    def forward(self, x):
+        p = self.pool(x)
+        p = nn.functional.interpolate(p, size=x.shape[2:], mode='bilinear', align_corners=False)
+        return self.proj(torch.cat([self.conv1(x), self.conv2(x), self.conv3(x), self.conv4(x), p], dim=1))
 
 
 # ------------------------------------------------------------------ #
-# Deep Residual UNet
+# StrongUNet
 # ------------------------------------------------------------------ #
 
-class UNet(nn.Module):
+class StrongUNet(nn.Module):
     """
-    Deep Residual UNet — 5 levels, residual blocks, dropout.
+    Deep Residual UNet with ASPP bottleneck.
+    base=64 → ~31M params. Designed for cryo-EM segmentation.
     Input:  (B, 1, H, W)
     Output: (B, 1, H, W) in [0, 1]
     """
-    def __init__(self, base_channels=32):
+    def __init__(self, base=64):
         super().__init__()
-        b = base_channels  # 32
+        b = base  # 64
 
-        # Encoder (5 levels)
-        self.inc    = ResDoubleConv(1,    b)       # 1   → 32
-        self.down1  = Down(b,    b*2)              # 32  → 64
-        self.down2  = Down(b*2,  b*4)              # 64  → 128
-        self.down3  = Down(b*4,  b*8)              # 128 → 256
-        self.down4  = Down(b*8,  b*16)             # 256 → 512
+        # Encoder
+        self.enc1 = EncoderBlock(1,    b,    dropout=0.05)   # 64
+        self.enc2 = EncoderBlock(b,    b*2,  dropout=0.1)    # 128
+        self.enc3 = EncoderBlock(b*2,  b*4,  dropout=0.1)    # 256
+        self.enc4 = EncoderBlock(b*4,  b*8,  dropout=0.15)   # 512
 
-        # Bottleneck
+        self.pool = nn.MaxPool2d(2)
+
+        # Bottleneck with ASPP
         self.bottleneck = nn.Sequential(
-            nn.MaxPool2d(2),
-            ResDoubleConv(b*16, b*32),             # 512 → 1024
-            ResDoubleConv(b*32, b*16),             # 1024 → 512 (compress back)
-            nn.ConvTranspose2d(b*16, b*16, kernel_size=2, stride=2),
+            EncoderBlock(b*8, b*16, dropout=0.2),             # 1024
+            ASPP(b*16, b*16),
         )
 
-        # Decoder (5 levels)
-        self.up1 = Up(b*32, b*8)                   # 512+512 → 256
-        self.up2 = Up(b*16, b*4)                   # 256+256 → 128
-        self.up3 = Up(b*8,  b*2)                   # 128+128 → 64
-        self.up4 = Up(b*4,  b)                     # 64+64   → 32
+        # Decoder
+        self.dec4 = DecoderBlock(b*16, b*8,  b*8,  dropout=0.15)
+        self.dec3 = DecoderBlock(b*8,  b*4,  b*4,  dropout=0.1)
+        self.dec2 = DecoderBlock(b*4,  b*2,  b*2,  dropout=0.1)
+        self.dec1 = DecoderBlock(b*2,  b,    b,    dropout=0.05)
 
-        # Output
-        self.outc = nn.Sequential(
-            nn.Conv2d(b, b, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, b),
+        # Output head
+        self.head = nn.Sequential(
+            nn.Conv2d(b, b//2, 3, padding=1, bias=False),
+            nn.GroupNorm(8, b//2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(b, 1, kernel_size=1),
+            nn.Conv2d(b//2, 1, 1),
             nn.Sigmoid(),
         )
 
     def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x5b = self.bottleneck(x5)
-        x  = self.up1(x5b, x5)
-        x  = self.up2(x,   x4)
-        x  = self.up3(x,   x3)
-        x  = self.up4(x,   x2)
-        return self.outc(x)
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        b  = self.bottleneck(self.pool(e4))
+        x  = self.dec4(b,  e4)
+        x  = self.dec3(x,  e3)
+        x  = self.dec2(x,  e2)
+        x  = self.dec1(x,  e1)
+        return self.head(x)
 
 
 # ------------------------------------------------------------------ #
-# Loss: BCE + Dice
+# Loss: BCE + Dice (Dice-heavy for cryo-EM)
 # ------------------------------------------------------------------ #
 
 class BCEDiceLoss(nn.Module):
-    def __init__(self, bce_weight=0.4):
+    def __init__(self, bce_weight=0.3):
         super().__init__()
         self.bce_weight = bce_weight
         self.bce = nn.BCELoss()
 
     def dice_loss(self, pred, target, smooth=1.0):
-        pred_flat    = pred.view(-1)
-        target_flat  = target.view(-1)
-        intersection = (pred_flat * target_flat).sum()
-        return 1 - (2 * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+        p = pred.view(-1)
+        t = target.view(-1)
+        return 1 - (2 * (p * t).sum() + smooth) / (p.sum() + t.sum() + smooth)
 
     def forward(self, pred, target):
         return self.bce_weight * self.bce(pred, target) + (1 - self.bce_weight) * self.dice_loss(pred, target)
 
 
 # ------------------------------------------------------------------ #
-# Lightning wrapper
+# Lightning wrapper — compatible with existing train.py / infer.py
 # ------------------------------------------------------------------ #
 
 class MicrographCleaner(pl.LightningModule):
-    def __init__(self, base_channels=32, learning_rate=3e-4):
+    def __init__(self, base=64, learning_rate=3e-4):
         super().__init__()
         self.save_hyperparameters()
-        self.model  = UNet(base_channels=base_channels)
-        self.lossF  = BCEDiceLoss(bce_weight=0.4)
+        self.model = StrongUNet(base=base)
+        self.lossF = BCEDiceLoss(bce_weight=0.3)
         self.learning_rate = learning_rate
 
     def forward(self, x):
@@ -167,10 +194,15 @@ class MicrographCleaner(pl.LightningModule):
         optimizer = torch.optim.AdamW(
             self.parameters(), lr=self.learning_rate, weight_decay=1e-4
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=30, eta_min=1e-6
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.learning_rate,
+            epochs=45,
+            steps_per_epoch=100,
+            pct_start=0.1,
+            anneal_strategy='cos',
         )
         return {
             'optimizer': optimizer,
-            'lr_scheduler': {'scheduler': scheduler, 'interval': 'epoch'},
+            'lr_scheduler': {'scheduler': scheduler, 'interval': 'step'},
         }
